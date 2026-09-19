@@ -4,8 +4,10 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 const APP_SLUG = "htxawr2026";
 const TEAM_ID = "6a9fb473863549b0de677041";
+const CLASSIFICATION_ID = "6a69f7e8725c1897da5beda5";
 const API_ROOT = `https://api.42campaign.io/app/applications/${APP_SLUG}`;
 const POLL_INTERVAL_MS = 60_000;
+const LEADERBOARD_PAGE_SIZE = 100;
 const CACHE_KEY = `pixel-race:${TEAM_ID}`;
 
 type Team = {
@@ -40,9 +42,39 @@ type MembersPayload = {
 
 type TeamPayload = { data: Team };
 
+type LeaderboardPayload = {
+  data?:
+    | unknown[]
+    | {
+        items?: unknown[];
+        records?: unknown[];
+        results?: unknown[];
+      };
+  metadata?: {
+    totalRecords?: number;
+    page?: number;
+    maxPage?: number;
+    perPage?: number;
+  };
+  meta?: {
+    totalRecords?: number;
+    page?: number;
+    maxPage?: number;
+    perPage?: number;
+  };
+};
+
+type TeamStanding = {
+  rank: number;
+  page: number;
+  totalTeams: number | null;
+};
+
 type Snapshot = {
   team: Team;
   members: Member[];
+  teamRank?: number;
+  totalTeams?: number | null;
   updatedAt: string;
 };
 
@@ -111,6 +143,123 @@ async function fetchJson<T>(url: string, signal: AbortSignal): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+function positiveInteger(value: unknown) {
+  const parsed = typeof value === "number" ? value : Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+function leaderboardEntries(payload: LeaderboardPayload) {
+  if (Array.isArray(payload.data)) return payload.data;
+  if (!payload.data) return [];
+  return payload.data.items ?? payload.data.records ?? payload.data.results ?? [];
+}
+
+function leaderboardMetadata(payload: LeaderboardPayload) {
+  return payload.metadata ?? payload.meta ?? {};
+}
+
+function containsTeamId(value: unknown, depth = 0): boolean {
+  if (value === TEAM_ID) return true;
+  if (depth >= 4 || value === null || typeof value !== "object") return false;
+
+  if (Array.isArray(value)) {
+    return value.some((item) => containsTeamId(item, depth + 1));
+  }
+
+  return Object.values(value as Record<string, unknown>).some((item) =>
+    containsTeamId(item, depth + 1),
+  );
+}
+
+function rankFromEntry(entry: unknown, fallbackRank: number): number {
+  if (entry === null || typeof entry !== "object") return fallbackRank;
+  const record = entry as Record<string, unknown>;
+
+  for (const key of ["rank", "ranking", "position", "place"]) {
+    const rank = positiveInteger(record[key]);
+    if (rank) return rank;
+  }
+
+  for (const key of ["team", "group", "result", "stats"]) {
+    const nested = record[key];
+    if (nested && typeof nested === "object") {
+      const rank: number = rankFromEntry(nested, fallbackRank);
+      if (rank !== fallbackRank) return rank;
+    }
+  }
+
+  return fallbackRank;
+}
+
+function standingOnPage(payload: LeaderboardPayload, page: number): TeamStanding | null {
+  const entries = leaderboardEntries(payload);
+  const index = entries.findIndex((entry) => containsTeamId(entry));
+  if (index === -1) return null;
+
+  const metadata = leaderboardMetadata(payload);
+  const perPage = positiveInteger(metadata.perPage) ?? LEADERBOARD_PAGE_SIZE;
+  const fallbackRank = (page - 1) * perPage + index + 1;
+
+  return {
+    rank: rankFromEntry(entries[index], fallbackRank),
+    page,
+    totalTeams: positiveInteger(metadata.totalRecords),
+  };
+}
+
+function leaderboardUrl(page: number) {
+  const search = new URLSearchParams({
+    perPage: String(LEADERBOARD_PAGE_SIZE),
+    page: String(page),
+    virtualRunID: "",
+    classificationID: CLASSIFICATION_ID,
+    type: "group",
+  });
+  return `${API_ROOT}/leaderboards?${search.toString()}`;
+}
+
+async function findTeamStanding(
+  firstPayload: LeaderboardPayload,
+  firstPage: number,
+  rankHint: number | null,
+  signal: AbortSignal,
+): Promise<TeamStanding | null> {
+  const firstMatch = standingOnPage(firstPayload, firstPage);
+  if (firstMatch) return firstMatch;
+
+  const metadata = leaderboardMetadata(firstPayload);
+  const totalRecords = positiveInteger(metadata.totalRecords);
+  const reportedMaxPage = positiveInteger(metadata.maxPage);
+  const reportedPageSize = positiveInteger(metadata.perPage) ?? LEADERBOARD_PAGE_SIZE;
+  const maxPage =
+    reportedMaxPage ??
+    (totalRecords ? Math.ceil(totalRecords / reportedPageSize) : 1);
+  const hintedPage = rankHint
+    ? Math.ceil(rankHint / reportedPageSize)
+    : null;
+  const candidates: number[] = [];
+
+  const addCandidate = (page: number | null) => {
+    if (page && page >= 1 && page <= maxPage && page !== firstPage && !candidates.includes(page)) {
+      candidates.push(page);
+    }
+  };
+
+  // The summary rank and last-known page make the common path one or two requests.
+  addCandidate(hintedPage);
+  addCandidate(firstPage - 1);
+  addCandidate(firstPage + 1);
+  for (let page = 1; page <= maxPage; page += 1) addCandidate(page);
+
+  for (const page of candidates) {
+    const payload = await fetchJson<LeaderboardPayload>(leaderboardUrl(page), signal);
+    const match = standingOnPage(payload, page);
+    if (match) return match;
+  }
+
+  return null;
+}
+
 function PixelRunner({ member, leader }: { member: Member; leader: boolean }) {
   const [shirt, shorts, skin, accent] = paletteFor(member._id);
   const style = {
@@ -146,6 +295,8 @@ function PixelRunner({ member, leader }: { member: Member; leader: boolean }) {
 
 export default function Home() {
   const [team, setTeam] = useState<Team | null>(null);
+  const [classificationRank, setClassificationRank] = useState<number | null>(null);
+  const [totalTeams, setTotalTeams] = useState<number | null>(null);
   const [members, setMembers] = useState<Member[]>([]);
   const [movements, setMovements] = useState<Record<string, Movement>>({});
   const [updatedAt, setUpdatedAt] = useState<string | null>(null);
@@ -160,17 +311,24 @@ export default function Home() {
   const [announcement, setAnnouncement] = useState("");
   const [pulse, setPulse] = useState(0);
   const previousMembers = useRef<Member[]>([]);
+  const leaderboardPage = useRef(1);
   const mounted = useRef(true);
   const nextRefreshRef = useRef(nextRefreshAt);
 
   const loadStandings = useCallback(async (manual = false) => {
     const controller = new AbortController();
-    const timeout = window.setTimeout(() => controller.abort(), 12_000);
+    const timeout = window.setTimeout(() => controller.abort(), 20_000);
 
     if (manual) setStatus("loading");
 
     try {
-      const [teamPayload, firstPage] = await Promise.all([
+      const preferredLeaderboardPage = leaderboardPage.current;
+      const leaderboardRequest = fetchJson<LeaderboardPayload>(
+        leaderboardUrl(preferredLeaderboardPage),
+        controller.signal,
+      ).catch(() => null);
+
+      const [teamPayload, firstPage, firstLeaderboardPage] = await Promise.all([
         fetchJson<TeamPayload>(
           `${API_ROOT}/groups/team/${TEAM_ID}?skip=0&limit=50`,
           controller.signal,
@@ -179,6 +337,7 @@ export default function Home() {
           `${API_ROOT}/groups/teams/${TEAM_ID}/members?type=challenge&perPage=50&page=1`,
           controller.signal,
         ),
+        leaderboardRequest,
       ]);
 
       let allMembers = [...firstPage.data];
@@ -198,6 +357,27 @@ export default function Home() {
 
       allMembers.sort((a, b) => a.rank - b.rank);
       const cachedPrevious = safeSnapshot(window.localStorage.getItem(CACHE_KEY));
+      let standing: TeamStanding | null = null;
+
+      if (firstLeaderboardPage) {
+        try {
+          standing = await findTeamStanding(
+            firstLeaderboardPage,
+            preferredLeaderboardPage,
+            positiveInteger(teamPayload.data.rank),
+            controller.signal,
+          );
+        } catch {
+          // Ranking is supplementary; member standings should stay live if it fails.
+        }
+      }
+
+      if (standing) leaderboardPage.current = standing.page;
+      const nextTeamRank =
+        standing?.rank ??
+        cachedPrevious?.teamRank ??
+        positiveInteger(teamPayload.data.rank);
+      const nextTotalTeams = standing?.totalTeams ?? cachedPrevious?.totalTeams ?? null;
       const previous = previousMembers.current.length
         ? previousMembers.current
         : (cachedPrevious?.members ?? []);
@@ -218,12 +398,16 @@ export default function Home() {
       const snapshot: Snapshot = {
         team: teamPayload.data,
         members: allMembers,
+        teamRank: nextTeamRank ?? undefined,
+        totalTeams: nextTotalTeams,
         updatedAt: syncTime,
       };
 
       if (!mounted.current) return;
       previousMembers.current = allMembers;
       setTeam(teamPayload.data);
+      setClassificationRank(nextTeamRank);
+      setTotalTeams(nextTotalTeams);
       setMembers(allMembers);
       setMovements(nextMovements);
       setUpdatedAt(syncTime);
@@ -241,6 +425,8 @@ export default function Home() {
       if (cached) {
         previousMembers.current = cached.members;
         setTeam(cached.team);
+        setClassificationRank(cached.teamRank ?? positiveInteger(cached.team.rank));
+        setTotalTeams(cached.totalTeams ?? null);
         setMembers(cached.members);
         setUpdatedAt(cached.updatedAt);
         setStatus("cached");
@@ -300,9 +486,12 @@ export default function Home() {
   const nextRefreshLabel = status === "loading" ? "SYNCING" : `${secondsToRefresh.toString().padStart(2, "0")} SEC`;
   const statusLabel = status === "live" ? "LIVE" : status === "cached" ? "CACHED" : status === "error" ? "OFFLINE" : "SYNCING";
 
-  const teamRank = team?.rank
-    ? `#${new Intl.NumberFormat("en-SG").format(team.rank)}`
+  const teamRank = classificationRank
+    ? `#${new Intl.NumberFormat("en-SG").format(classificationRank)}`
     : "—";
+  const teamRankContext = totalTeams
+    ? `OF ${new Intl.NumberFormat("en-SG").format(totalTeams)} TEAMS · CLASSIFICATION`
+    : "CLASSIFICATION STANDING";
 
   return (
     <main className="site-shell">
@@ -342,7 +531,7 @@ export default function Home() {
           <article className="stat-card">
             <span>TEAM RANK</span>
             <strong>{teamRank}</strong>
-            <small>EVENT STANDING</small>
+            <small>{teamRankContext}</small>
           </article>
           <article className="stat-card">
             <span>RUNNERS</span>
